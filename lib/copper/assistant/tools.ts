@@ -293,6 +293,15 @@ export const transferToRefundAgent = tool({
   execute: async () => ({ handedTo: "Refund agent" }),
 });
 
+/**
+ * Module 5: the single support agent's tools: everything Copper and the Refund
+ * agent have, minus the two handoffs.
+ */
+export function supportAgentTools(desk: Desk) {
+  const { get_orders, request_refund } = refundAgentTools(desk);
+  return { ...copperTools, get_orders, request_refund };
+}
+
 /** The Refund agent's own tools (Module 4). Copper can't use these. */
 export function refundAgentTools(desk: Desk) {
   return {

@@ -8,6 +8,7 @@ import {
   MODELS,
   type ModelId,
 } from "@/lib/ai/models";
+import type { Trace } from "@/lib/ai/langfuse";
 import { costUsd } from "@/lib/ai/pricing";
 
 // Every model call in the app goes through this file, so each one is logged
@@ -27,8 +28,91 @@ export function isAiConfigured(): boolean {
   return Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY);
 }
 
-/** Which module and feature made the call, for the ai_calls log. */
-export type CallInfo = { module: number; feature: string; model?: ModelId };
+/**
+ * Which module and feature made the call, for the ai_calls log. Module 5: with
+ * a `trace`, the call is also recorded in Langfuse, named `name` (the agent).
+ */
+export type CallInfo = {
+  module: number;
+  feature: string;
+  model?: ModelId;
+  trace?: Trace;
+  name?: string;
+};
+
+/**
+ * Google's free tier turns away bursts of requests. Each call is retried this
+ * many times (waiting 2, 4, 8, then 16 seconds) before it gives up.
+ */
+const MAX_RETRIES = 4;
+
+/** Google's own name for a model, as Langfuse shows it. */
+function providerModelId(model: ModelId): string {
+  const entry = MODELS.find((m) => m.id === model);
+  return entry && "googleId" in entry
+    ? entry.googleId
+    : model.slice("google/".length);
+}
+
+type StepLike = {
+  toolCalls?: { toolCallId: string; toolName: string; input?: unknown }[];
+  toolResults?: { toolCallId: string; output?: unknown }[];
+};
+
+/** Records one model call, and each tool it used, on the trace. */
+function recordGeneration(
+  info: CallInfo,
+  model: ModelId,
+  startTime: Date,
+  result: {
+    input?: unknown;
+    output?: unknown;
+    usage?: Usage;
+    steps?: StepLike[];
+    error?: unknown;
+  },
+) {
+  const { trace } = info;
+  if (!trace) return;
+  const endTime = new Date();
+  const inputTokens = result.usage?.inputTokens;
+  const outputTokens = result.usage?.outputTokens;
+  const generationId = trace.generation({
+    name: info.name ?? info.feature,
+    model: providerModelId(model),
+    startTime,
+    endTime,
+    input: result.input,
+    output: result.output,
+    inputTokens,
+    outputTokens,
+    costUsd:
+      inputTokens !== undefined && outputTokens !== undefined
+        ? costUsd(model, inputTokens, outputTokens)
+        : undefined,
+    metadata: { module: info.module, feature: info.feature },
+    error:
+      result.error === undefined
+        ? undefined
+        : result.error instanceof Error
+          ? result.error.message
+          : String(result.error),
+  });
+  for (const step of result.steps ?? []) {
+    for (const call of step.toolCalls ?? []) {
+      trace.tool({
+        name: `tool: ${call.toolName}`,
+        parentId: generationId,
+        startTime,
+        endTime,
+        input: call.input,
+        output: step.toolResults?.find((r) => r.toolCallId === call.toolCallId)
+          ?.output,
+        metadata: { agent: info.name, tool: call.toolName },
+      });
+    }
+  }
+}
 
 // Omit that keeps generateText's "prompt or messages" union intact.
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
@@ -95,26 +179,40 @@ function rowFor(info: CallInfo, model: ModelId, started: number) {
   };
 }
 
-async function tracked<T extends { usage: Usage }>(
+async function tracked<T extends { usage: Usage; text?: string }>(
   info: CallInfo,
+  input: unknown,
   run: (model: ModelId) => Promise<T>,
 ): Promise<T> {
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
+  const startTime = new Date();
   try {
     const result = await run(model);
     await logCall(row(true, result.usage));
+    recordGeneration(info, model, startTime, {
+      input,
+      output: result.text,
+      usage: result.usage,
+    });
     return result;
   } catch (error) {
-    if (!(error instanceof AiNotConfiguredError)) await logCall(row(false));
+    if (!(error instanceof AiNotConfiguredError)) {
+      await logCall(row(false));
+      recordGeneration(info, model, startTime, { input, error });
+    }
     throw error;
   }
 }
 
 /** Generates text. Example: callText({ module: 3, feature: "support-answer" }, { prompt }) */
 export async function callText(info: CallInfo, options: TextOptions) {
-  return tracked(info, (model) =>
-    generateText({ ...options, model: languageModel(model) }),
+  return tracked(info, options.prompt ?? options.messages, (model) =>
+    generateText({
+      maxRetries: MAX_RETRIES,
+      ...options,
+      model: languageModel(model),
+    }),
   );
 }
 
@@ -124,8 +222,9 @@ export async function callObject<Schema extends z.ZodType>(
   options: TextOptions & { schema: Schema },
 ) {
   const { schema, ...rest } = options;
-  const result = await tracked(info, (model) =>
+  const result = await tracked(info, rest.prompt ?? rest.messages, (model) =>
     generateText({
+      maxRetries: MAX_RETRIES,
       ...rest,
       model: languageModel(model),
       output: Output.object({ schema }),
@@ -187,11 +286,26 @@ type StreamOptions = DistributiveOmit<
 export function callStream(info: CallInfo, options: StreamOptions) {
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
+  const startTime = new Date();
+  // The conversation so far, as Langfuse shows it: the latest message is enough.
+  const input = options.messages?.at(-1) ?? options.prompt;
   return streamText({
+    maxRetries: MAX_RETRIES,
     ...options,
     model: languageModel(model),
-    onFinish: ({ totalUsage }) => logCall(row(true, totalUsage)),
-    onError: () => logCall(row(false)),
+    onFinish: ({ totalUsage, text, steps }) => {
+      recordGeneration(info, model, startTime, {
+        input,
+        output: text,
+        usage: totalUsage,
+        steps,
+      });
+      return logCall(row(true, totalUsage));
+    },
+    onError: ({ error }) => {
+      recordGeneration(info, model, startTime, { input, error });
+      return logCall(row(false));
+    },
   });
 }
 
