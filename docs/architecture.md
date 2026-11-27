@@ -171,3 +171,37 @@ the tests and a golden-set evaluation with an AI judge run in GitHub Actions
 on every pull request, with `main` protected; every AI call is traced in
 Langfuse; and one support agent that does everything is compared with the two
 agents on the same golden set. Langfuse is the only eval and monitoring tool.
+
+## Module 5: Safe to ship (CI, Langfuse tracing, evals, single vs multi agent)
+
+**Summary:** Every pull request runs the tests and a golden-set eval in GitHub
+Actions, and `main` is protected so neither can be skipped. Every Ask Copper
+question is one Langfuse trace. An AI judge grades the golden set, its scores
+go to Langfuse, and the same set runs on the two agents and on one support
+agent to compare them.
+
+| Piece | Where | What it does |
+|---|---|---|
+| Tracing | `lib/ai/langfuse.ts` | `Trace`: one per question. Sent as OTLP JSON to Langfuse's OpenTelemetry endpoint (`/api/public/otel/v1/traces`; the old ingestion API stopped taking traces on 2026-11-16): a root span (input, answer, who answered, tools, tags), a `generation` per agent call (model, tokens, cost) and a `tool` per tool call. Scores go to `/api/public/scores`. Does nothing without `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` |
+| AI calls | `lib/ai/call.ts` | `CallInfo.trace` and `name`: each call records itself on the trace (`recordGeneration`). Every call retries up to 4 times (Google's free tier turns away bursts) |
+| Agents | `lib/copper/assistant/ask.ts` | `architecture`: `multi` (Copper + Refund agent, the default) or `single` (one support agent, `SUPPORT_AGENT_INSTRUCTIONS` + `supportAgentTools`: every tool, no handoff). `AGENT_ARCHITECTURE=single` switches the app. The final progress carries `traceId` and `usage` (tokens, cost, time) |
+| Golden set | `evals/golden-set.ts` | 10 questions (prices, stock, documents, refund policy, out of scope, four refunds and a prompt injection), each with what a good answer does and the tools that must (not) be used |
+| AI judge | `evals/judge.ts` | `callObject` (`{ module: 5, feature: "eval-judge" }`) returns `pass`, `score` and `reason` |
+| Eval runner | `evals/golden.eval.ts`, `vitest.eval.config.mts` | `npm run eval` (two agents, fails under 80%), `npm run eval:compare` (both). Scores `judge`, `tools_ok` and `passed` on each trace; each run is a Langfuse dataset run of `copper-golden-set`; writes `eval-results/summary.md` and the GitHub job summary |
+| CI | `.github/workflows/ci.yml` | `check` (lint, typecheck, tests, build on 3 OSes) and `eval` on every pull request. Keys come from the repo's Actions secrets. Branch protection on `main` requires both, and a pull request |
+
+**Data flow:** question → `askCopper` → one or two agents (each call recorded
+on the trace) → answer → trace sent to Langfuse. Eval: golden question →
+`askCopper` → tool checks + AI judge → scores on the trace → dataset run →
+summary in the pull request's checks.
+
+**Decisions and trade-offs:** Plain `fetch` to Langfuse's OpenTelemetry
+endpoint instead of the Langfuse SDK: no new packages, and the app stays in
+charge of flushing (a serverless function can end right after the answer).
+The judge uses the same Gemini model as the agents, through `lib/ai/call.ts`.
+Only the architecture that ships (two agents) gates the merge; the single agent
+is an experiment.
+
+**Risks and open questions:** The eval calls a real model, so results vary a
+little run to run, and Google's free tier limits how many calls a day CI can
+make. An AI judge can be wrong; the tool checks are code and don't depend on it.

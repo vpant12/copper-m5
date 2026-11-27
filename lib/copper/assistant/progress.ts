@@ -35,7 +35,18 @@ export type Progress = {
   status: "working" | "done" | "error";
   /** Who wrote the reply. Copper unless set. */
   agent?: Agent;
+  /** Module 5: the answer's Langfuse trace, and what it took (set when done). */
+  traceId?: string;
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    costUsd: number;
+    latencyMs: number;
+  };
 };
+
+/** Module 5: two agents with a handoff (as built in Module 4), or one that does it all. */
+export type Architecture = "multi" | "single";
 
 /** Every tool call in an answer, in order. */
 export function toolCallsOf(progress: Progress) {

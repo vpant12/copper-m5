@@ -1,8 +1,12 @@
 name: CI
 
+# Module 5: runs on every pull request (and on main after a merge). Branch
+# protection on main requires both jobs to pass before a pull request merges.
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
@@ -23,3 +27,44 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  # The golden-set eval: Ask Copper answers each question in evals/golden-set.ts,
+  # an AI judge grades it, and the scores go to Langfuse. It fails when fewer
+  # than 80% of the answers pass. The scores show in this job's summary and as
+  # a notice on the pull request's checks.
+  eval:
+    name: eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Check the keys are set
+        shell: bash
+        run: |
+          missing=0
+          for name in GOOGLE_GENERATIVE_AI_API_KEY LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Add $name to the repo's Settings > Secrets and variables > Actions."
+              missing=1
+            fi
+          done
+          exit $missing
+      - run: npm ci
+      - name: Golden-set eval (AI judge, scores to Langfuse)
+        run: npm run eval
+      - name: Keep the eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval-results/
+          if-no-files-found: ignore

@@ -9,22 +9,29 @@
 // talking. Copper can hand the conversation to the Refund agent, a second
 // agent with its own instructions and tools, and the Refund agent can hand it
 // back. The agent that ends the turn answers the next message too.
+// Module 5: every question is traced in Langfuse (lib/ai/langfuse.ts), and the
+// same questions can run on one support agent with every tool and no handoff
+// ("single"), to compare with the two agents ("multi", the default).
 import { hasToolCall, stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
+import { Trace } from "@/lib/ai/langfuse";
 import { createLive, type Live } from "@/lib/ai/live";
 import {
   COPPER_HANDOFF,
   COPPER_INSTRUCTIONS,
   REFUND_AGENT_INSTRUCTIONS,
+  SUPPORT_AGENT_INSTRUCTIONS,
 } from "@/lib/copper/assistant/instructions";
 import type {
   Agent,
+  Architecture,
   Progress,
   ToolStep,
 } from "@/lib/copper/assistant/progress";
 import {
   copperTools,
   refundAgentTools,
+  supportAgentTools,
   transferToRefundAgent,
 } from "@/lib/copper/assistant/tools";
 import type { Desk } from "@/lib/copper/orders";
@@ -38,7 +45,28 @@ export type AskCopperRequest = {
   desk?: Desk;
   /** Who answers first: whoever ended the last turn. Copper by default. */
   agent?: Agent;
+  /**
+   * Two agents with a handoff ("multi", the default) or one support agent
+   * ("single"). AGENT_ARCHITECTURE=single sets it for the whole app.
+   */
+  architecture?: Architecture;
+  /** Extra Langfuse tags, such as the eval case. */
+  tags?: string[];
+  /** Make the Langfuse trace public (anyone with the link can view it). */
+  share?: boolean;
 };
+
+/** The app's architecture unless a request names one. */
+function defaultArchitecture(): Architecture {
+  return process.env.AGENT_ARCHITECTURE === "single" ? "single" : "multi";
+}
+
+/** How each agent is named in Langfuse. */
+const TRACE_NAMES = {
+  copper: "Copper",
+  refund: "Refund agent",
+  single: "Support agent",
+} as const;
 
 export type AskCopperResult = { progress: Live<Progress> };
 
@@ -62,10 +90,32 @@ const STOP = [
 const SORRY = "Sorry, something went wrong on my end. Please try again.";
 
 /** One agent's call: its instructions and only its own tools. */
-function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
+function agentCall(
+  agent: Agent,
+  messages: ChatMessage[],
+  desk: Desk | undefined,
+  architecture: Architecture,
+  trace: Trace,
+) {
+  if (architecture === "single" && desk)
+    return callStream(
+      {
+        module: 5,
+        feature: "support-agent",
+        trace,
+        name: TRACE_NAMES.single,
+      },
+      {
+        messages,
+        providerOptions: THOUGHT_SUMMARIES,
+        instructions: SUPPORT_AGENT_INSTRUCTIONS,
+        tools: supportAgentTools(desk),
+        stopWhen: stepCountIs(MAX_STEPS),
+      },
+    );
   if (agent === "refund" && desk)
     return callStream(
-      { module: 4, feature: "refund-agent" },
+      { module: 4, feature: "refund-agent", trace, name: TRACE_NAMES.refund },
       {
         messages,
         providerOptions: THOUGHT_SUMMARIES,
@@ -75,7 +125,7 @@ function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
       },
     );
   return callStream(
-    { module: 2, feature: "ask-copper" },
+    { module: 2, feature: "ask-copper", trace, name: TRACE_NAMES.copper },
     {
       messages,
       providerOptions: THOUGHT_SUMMARIES,
@@ -95,14 +145,36 @@ export async function askCopper({
   useTools,
   desk,
   agent = "copper",
+  architecture = defaultArchitecture(),
+  tags = [],
+  share = false,
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
-  const first: Agent = desk && useTools ? agent : "copper";
+  // The single agent never hands off, so it always answers first.
+  const first: Agent =
+    desk && useTools && architecture === "multi" ? agent : "copper";
+  const started = performance.now();
+  const trace = new Trace("ask-copper", {
+    input: messages.at(-1)?.content,
+    metadata: {
+      architecture,
+      useTools,
+      firstAgent: architecture === "single" ? "single" : first,
+      page: desk ? "support" : "home",
+      turns: messages.length,
+    },
+    tags: [
+      useTools ? `${architecture}-agent` : "no-tools",
+      desk ? "support-page" : "home-page",
+      ...tags,
+    ],
+  });
   const progress: Progress = {
     steps: [],
     reply: "",
     status: "working",
     agent: first,
+    traceId: trace.id,
   };
   // A fresh copy each time, so earlier updates never change underneath the
   // panel.
@@ -187,6 +259,9 @@ export async function askCopper({
       }
       update(snapshot());
     }
+    // Let the call finish recording itself (tokens, cost) on the trace.
+    await Promise.resolve(result.steps).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
     return handoff;
   }
 
@@ -199,7 +274,12 @@ export async function askCopper({
         await follow(
           "copper",
           callStream(
-            { module: 2, feature: "ask-copper" },
+            {
+              module: 2,
+              feature: "ask-copper",
+              trace,
+              name: "Copper (no tools)",
+            },
             { messages, providerOptions: THOUGHT_SUMMARIES },
           ),
         );
@@ -208,7 +288,7 @@ export async function askCopper({
         for (let handoffs = 0; ; handoffs++) {
           const next = await follow(
             current,
-            agentCall(current, messages, desk),
+            agentCall(current, messages, desk, architecture, trace),
           );
           if (!next || next === current || handoffs >= MAX_HANDOFFS) break;
           progress.steps.push({ type: "handoff", from: current, to: next });
@@ -220,10 +300,41 @@ export async function askCopper({
       }
       progress.status = "done";
       if (!progress.reply.trim()) progress.reply = SORRY;
-    } catch {
+    } catch (error) {
+      console.error(
+        "[ask-copper] failed:",
+        error instanceof Error ? error.message : String(error),
+      );
       progress.status = "error";
       if (!progress.reply.trim()) progress.reply = SORRY;
     }
+
+    // Module 5: close the Langfuse trace: who answered, with which tools,
+    // and what it took.
+    const tools = progress.steps.flatMap((s) =>
+      s.type === "tool" ? [s.name] : [],
+    );
+    const answeredBy =
+      architecture === "single" && desk && useTools
+        ? TRACE_NAMES.single
+        : TRACE_NAMES[progress.agent ?? "copper"];
+    progress.usage = {
+      ...trace.totals,
+      latencyMs: Math.round(performance.now() - started),
+    };
+    trace.finish({
+      output: progress.reply,
+      metadata: {
+        answeredBy,
+        tools,
+        handoffs: progress.steps.filter((s) => s.type === "handoff").length,
+        status: progress.status,
+        latencyMs: progress.usage.latencyMs,
+      },
+      tags: [`answered-by:${answeredBy}`],
+      public: share,
+    });
+    await trace.flush();
     done(snapshot());
   })();
 
