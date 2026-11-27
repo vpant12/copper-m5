@@ -31,6 +31,7 @@ import { judge } from "./judge";
 const DATASET = "copper-golden-set";
 /** This case's multi-agent trace is shared publicly (a refund conversation). */
 const SHARED_CASE = "refund-over-limit";
+const PAUSE_MS = Number(process.env.EVAL_PAUSE_MS ?? 3000);
 let sharedTraceUrl: string | null = null;
 /** The two agents must pass at least this share of the golden set. */
 const MIN_PASS_RATE = Number(process.env.EVAL_MIN_PASS_RATE ?? 0.8);
@@ -279,7 +280,10 @@ describe.skipIf(!isAiConfigured())("golden-set eval", () => {
         if (!summaries.length) await syncDataset();
         const runName = `${architecture}-agent ${label}`;
         const results: CaseResult[] = [];
-        for (const testCase of cases) {
+        for (const [i, testCase] of cases.entries()) {
+          // A short pause between questions: Google's free tier allows only a
+          // few requests a minute. (The time per answer doesn't include it.)
+          if (i > 0) await new Promise((r) => setTimeout(r, PAUSE_MS));
           const result = await runCase(testCase, architecture, runName);
           results.push(result);
           console.log(
